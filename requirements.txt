@@ -8,4 +8,7 @@ python-multipart==0.0.6
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 opencv-python-headless==4.10.0.84
+ultralytics==8.3.33
+torch==2.1.0
+torchvision==0.16.1
 requests==2.32.3
