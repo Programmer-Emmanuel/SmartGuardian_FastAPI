@@ -1,14 +1,13 @@
-# main_no_mediapipe_optimized.py
+# main_no_mediapipe_render.py
 """
-SmartGuardian Cloud - multi-detectors (optimized for low memory / Render)
-Detecte: weapon (knife/gun), fall, crowd, accident, fire, intrusion, vandalism
-Enregistre un clip de CLIP_DURATION secondes (pré-buffer + post) et poste un incident vers Laravel.
-Action recognition désactivée pour économiser la RAM.
+SmartGuardian Cloud - multi-detectors (version WITHOUT MediaPipe)
+Adapté pour Render / environnement sans webcam locale.
 """
 
 import os
 import time
 import threading
+import queue
 from collections import deque
 import json
 from fastapi import FastAPI
@@ -16,28 +15,36 @@ from fastapi.responses import StreamingResponse, HTMLResponse
 import cv2
 import numpy as np
 import requests
+
+# ML libs
 from ultralytics import YOLO
+import torch
+import torchvision.transforms as T
+from torchvision.models.video import r3d_18
 
 # ============ CONFIG ============
-CAM_IDX = 0
+# Capture depuis fichier ou flux réseau
+VIDEO_SOURCE = os.environ.get("VIDEO_SOURCE", "test.mp4")  # ex: "test.mp4" ou "rtsp://user:pass@ip:554/stream"
+
 FRAME_W, FRAME_H = 640, 480
-INFER_W, INFER_H = 224, 224  # plus petit pour économie mémoire
+INFER_W, INFER_H = 320, 240
 BROWSER_FPS = 12
 RECORD_FPS = 20
-CLIP_DURATION = 5  # réduit à 5 secondes
-PREBUFFER_SECONDS = 2
+CLIP_DURATION = 10
+PREBUFFER_SECONDS = 3
 PREBUFFER_FRAMES = PREBUFFER_SECONDS * RECORD_FPS
 
-YOLO_MODEL_PATH = "yolov8n.pt"  # nano model pour faible RAM
-LARAVEL_INCIDENT_URL = "http://127.0.0.1:8000/api/incidents"
+YOLO_MODEL_PATH = "yolov8s.pt"
+ACTION_MODEL_DEVICE = "cpu"
+ACTION_CLIP_LEN = 16
+ACTION_THRESHOLD = 0.6
+LARAVEL_INCIDENT_URL = os.environ.get("LARAVEL_INCIDENT_URL", "http://127.0.0.1:8000/api/incidents")
 
 os.makedirs("clips", exist_ok=True)
 
 # ============ Globals & queues ============
 app = FastAPI()
-camera = cv2.VideoCapture(CAM_IDX)
-camera.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
-camera.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+camera = cv2.VideoCapture(VIDEO_SOURCE)
 
 frame_lock = threading.Lock()
 latest_annotated = None
@@ -48,8 +55,21 @@ recording = False
 record_lock = threading.Lock()
 recording_queue = deque()
 
+action_request_q = queue.Queue(maxsize=4)
+action_result_q = queue.Queue(maxsize=4)
+
 # ============ Models init ============
 yolo = YOLO(YOLO_MODEL_PATH)
+device = ACTION_MODEL_DEVICE
+action_model = r3d_18(pretrained=True)
+action_model.eval().to(device)
+
+action_transform = T.Compose([
+    T.ToPILImage(),
+    T.Resize((112, 112)),
+    T.ToTensor(),
+    T.Normalize(mean=[0.43216,0.394666,0.37645], std=[0.22803,0.22145,0.216989])
+])
 
 # ============ Utilities ============
 def draw_overlay(frame, text_lines, color=(0,0,255)):
@@ -70,10 +90,9 @@ def save_clip_from_buffer(frames, filename):
         return None
     path = os.path.join("clips", filename)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(path, fourcc, RECORD_FPS, (320, 240))  # enregistrement petit pour RAM
+    out = cv2.VideoWriter(path, fourcc, RECORD_FPS, (FRAME_W, FRAME_H))
     for f in frames:
-        small = cv2.resize(f, (320, 240))
-        out.write(small)
+        out.write(f)
     out.release()
     return path
 
@@ -83,6 +102,36 @@ def send_incident_to_laravel(payload):
         print("[webhook] sent, status", r.status_code)
     except Exception as e:
         print("[webhook] error:", e)
+
+# ============ Action recognition worker ============
+def frames_to_action_tensor(frames_list):
+    with torch.no_grad():
+        imgs = [action_transform(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_list]
+        clip = torch.stack(imgs, dim=1)  # C x T x H x W
+        clip = clip.unsqueeze(0).to(device)
+        return clip
+
+def action_worker():
+    while True:
+        try:
+            clip_frames = action_request_q.get(timeout=1)
+        except queue.Empty:
+            continue
+        try:
+            tensor = frames_to_action_tensor(clip_frames)
+            with torch.no_grad():
+                out = action_model(tensor)
+                probs = torch.nn.functional.softmax(out, dim=1)
+                top_prob, top_idx = torch.max(probs, dim=1)
+                score = float(top_prob.item())
+                idx = int(top_idx.item())
+                label = f"k_{idx}"
+                action_result_q.put((label, score))
+        except Exception as e:
+            print("[action_worker] error", e)
+            action_result_q.put((None, 0.0))
+
+threading.Thread(target=action_worker, daemon=True).start()
 
 # ============ Detector loop ============
 def detector_loop():
@@ -110,18 +159,9 @@ def detector_loop():
         dangerous_detected = []
 
         for box in r.boxes:
-            try:
-                xyxy = box.xyxy[0].cpu().numpy() if hasattr(box.xyxy[0], 'cpu') else np.array(box.xyxy[0])
-            except Exception:
-                xyxy = np.array(box.xyxy[0])
-            try:
-                cls = int(box.cls[0].cpu().numpy()) if hasattr(box.cls[0], 'cpu') else int(box.cls[0])
-            except Exception:
-                cls = int(box.cls[0])
-            try:
-                conf = float(box.conf[0].cpu().numpy()) if hasattr(box.conf[0], 'cpu') else float(box.conf[0])
-            except Exception:
-                conf = float(box.conf[0])
+            xyxy = np.array(box.xyxy[0])
+            cls = int(box.cls[0])
+            conf = float(box.conf[0])
             label = r.names[cls] if hasattr(r, 'names') else yolo.names[cls]
             x1,y1,x2,y2 = int(xyxy[0]*scale_x), int(xyxy[1]*scale_y), int(xyxy[2]*scale_x), int(xyxy[3]*scale_y)
             detected_objects.append((label, conf, (x1,y1,x2,y2)))
@@ -202,6 +242,24 @@ def detector_loop():
         if vandalism_flag:
             incidents.append(("vandalism", {"motion": motion_magnitude}))
 
+        # Action recognition
+        need_action_check = any(t in ("crowd","accident","vandalism") for t,_ in incidents) or len(dangerous_detected)>0
+        if need_action_check:
+            with frame_lock:
+                clip_frames = list(prebuffer)[-ACTION_CLIP_LEN:] if len(prebuffer) >= ACTION_CLIP_LEN else list(prebuffer)
+                while len(clip_frames) < ACTION_CLIP_LEN:
+                    clip_frames.insert(0, clip_frames[0] if clip_frames else (latest_raw.copy() if latest_raw is not None else np.zeros((FRAME_H,FRAME_W,3),dtype=np.uint8)))
+            try:
+                action_request_q.put_nowait(clip_frames)
+            except queue.Full:
+                pass
+            try:
+                label, score = action_result_q.get_nowait()
+                if label == "fight" or (label.startswith("k_") and score > ACTION_THRESHOLD):
+                    incidents.append(("fight", {"label": label, "score": score}))
+            except queue.Empty:
+                pass
+
         # Annotate & trigger
         if incidents:
             annotated = raw.copy()
@@ -218,7 +276,6 @@ def detector_loop():
 
             with record_lock:
                 if not recording:
-                    print("[detector] incident detected -> start recording + webhook")
                     recording = True
                     with frame_lock:
                         for f in list(prebuffer):
@@ -266,11 +323,6 @@ def handle_incident(incidents):
         "details": incidents
     }
     payload = {"camera": camera_data, "incident": incident_data}
-
-    print("\n[INCIDENT DETECTED]")
-    print("Camera Info:", json.dumps(camera_data, indent=2))
-    print("Incident Info:", json.dumps(incident_data, indent=2))
-
     threading.Thread(target=send_incident_to_laravel, args=(payload,), daemon=True).start()
 
     with record_lock:
@@ -283,6 +335,7 @@ def camera_reader_thread():
     while True:
         ok, frame = camera.read()
         if not ok:
+            # si fin de vidéo ou flux mort, on attend un peu
             time.sleep(0.05)
             continue
         frame = cv2.resize(frame, (FRAME_W, FRAME_H))
@@ -323,7 +376,11 @@ def generate_frames():
 # ============ FastAPI routes ============
 @app.get("/")
 def home():
-    return {"message": "SmartGuardian Cloud - multi-detectors (optimized, no mediapipe)"}
+    return {"message": "SmartGuardian Cloud - multi-detectors (no mediapipe)"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 @app.get("/video")
 def video_feed():
@@ -334,7 +391,7 @@ def view_page():
     return """
     <html><head><title>SmartGuardian Dashboard</title></head>
     <body style='margin:0;background:#111;color:#fff;font-family:Arial;display:flex;flex-direction:column;align-items:center'>
-    <h2 style='margin:12px'>SmartGuardian Cloud - Dashboard (optimized)</h2>
+    <h2 style='margin:12px'>SmartGuardian Cloud - Dashboard (no mediapipe)</h2>
     <img src="/video" style='width:90%;max-width:1280px;border-radius:8px;box-shadow:0 10px 40px rgba(0,0,0,0.6)'/>
     </body></html>
     """
@@ -342,3 +399,9 @@ def view_page():
 # ============ Start threads ============
 threading.Thread(target=camera_reader_thread, daemon=True).start()
 threading.Thread(target=detector_loop, daemon=True).start()
+
+# ============ Run Uvicorn ============
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("main_no_mediapipe_render:app", host="0.0.0.0", port=port)
